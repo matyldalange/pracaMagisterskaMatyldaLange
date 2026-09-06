@@ -1,0 +1,74 @@
+# wersja pierwotna (pierwsza opisana w pracy)
+
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from src.dataset_hdn import MRIDataset
+from src.models_hdn import HDNGenerator, Discriminator
+from src.losses_hdn import InpaintingLoss
+
+DATASET_PATH = "/raid/s188598/comodGAN/brain_tumor_dataset/Training"
+SAVE_PATH = "./checkpointsNew"
+os.makedirs(SAVE_PATH, exist_ok=True)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EPOCHS = 100
+BATCH_SIZE = 16
+LR = 2e-4
+
+dataset = MRIDataset(root_dir=DATASET_PATH, img_size=256)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+
+netG = HDNGenerator().to(device)
+netD = Discriminator().to(device)
+
+criterion_total = InpaintingLoss().to(device)
+criterion_gan = nn.BCEWithLogitsLoss().to(device)
+
+optG = torch.optim.Adam(netG.parameters(), lr=LR, betas=(0.5, 0.999))
+optD = torch.optim.Adam(netD.parameters(), lr=LR, betas=(0.5, 0.999))
+
+for epoch in range(EPOCHS):
+    for i, (masked_img, mask, real_img, _) in enumerate(dataloader):
+        masked_img, mask, real_img = masked_img.to(device), mask.to(device), real_img.to(device)
+
+        optD.zero_grad()
+
+        d_real = netD(real_img)
+        loss_d_real = criterion_gan(d_real, torch.ones_like(d_real))
+
+        coarse_out, fine_out = netG(masked_img, mask)
+
+        d_fake = netD(fine_out.detach())
+        loss_d_fake = criterion_gan(d_fake, torch.zeros_like(d_fake))
+
+        loss_d = (loss_d_real + loss_d_fake) * 0.5
+        loss_d.backward()
+        optD.step()
+
+        optG.zero_grad()
+
+        loss_recon_coarse = criterion_total(coarse_out, real_img)
+        loss_recon_fine = criterion_total(fine_out, real_img)
+
+        g_fake_pred = netD(fine_out)
+        loss_g_adv = criterion_gan(g_fake_pred, torch.ones_like(g_fake_pred))
+
+        # ważona suma strat: 0.5 * Coarse + 1.0 * Fine + 0.1 * Adversarial
+        total_g_loss = 0.5 * loss_recon_coarse + 1.0 * loss_recon_fine + 0.1 * loss_g_adv
+
+        total_g_loss.backward()
+        optG.step()
+
+        if i % 10 == 0:
+            print(f"[Epoch {epoch}/{EPOCHS}] [Batch {i}/{len(dataloader)}] "
+                  f"G_loss: {total_g_loss.item():.4f} D_loss: {loss_d.item():.4f}")
+
+    # zapis punktu kontrolnego po każdej epoce
+    torch.save({
+        'epoch': epoch,
+        'netG_state_dict': netG.state_dict(),
+        'netD_state_dict': netD.state_dict(),
+    }, f"{SAVE_PATH}/hdn_epoch_{epoch}.pth")
